@@ -1,0 +1,248 @@
+#!/bin/sh
+# 受け取った更新を検査し、通ったものだけを GitHub に同期 push する。
+# GitHub 側で失敗したらこのフックも失敗するので、クライアントの push もエラーになる。
+#
+# コマンドのオプションは、なるべく長い形（--quiet など）で書く。短い形のままのものは、
+# 配布するイメージの busybox に長い形がないもの（grep・wc・tr・timeout など）か、git に長い形がないもの。
+set -euf   # -f: 保護ブランチ名をグロブ展開しない
+# 検査は「成功したことを確かめる」形で書く。子プロセス（grep や tr など）がメモリ不足やシグナルで止まったときに、
+# 空の出力や失敗の終了コードを「一致しない」「項目なし」と取り違えて、検査をすり抜けないように。
+# そのため、できる比較はシェルの組み込み（case や変数の展開）だけで行う
+NEWLINE='
+'
+TAB=$(printf '\t')
+ZERO_OID=0000000000000000000000000000000000000000
+# 受け付けの時間切れなどでプロセスグループごとシグナルを受けたら、GitHub に push する前なら拒否し、
+# push を始めた後なら最後まで動いて結果を記録する。シグナルで検査の子プロセス（grep や awk）が止まると、
+# 出力が空になって検査をすり抜けるので、印を付けておき、各 ref の検査の後と push の直前に確かめる
+# （シェルはシグナルの処理を、実行中のコマンドが終わってから行うので、検査中に受けたシグナルは必ず見つかる。
+# '' で無視すると子プロセスにも引き継がれ、timeout で止められなくなるので、印を付けるハンドラーにする。
+# なお、配布するイメージの busybox の timeout は receive-pack だけを止めるので、フックにはシグナルは届かず、
+# 入力が途中で切れるだけ。どちらの場合も、受け取った行はすべて検査してから push する）
+got_signal=""
+trap 'got_signal=yes' TERM HUP PIPE
+
+# 拒否して終わる。拒否も記録する（人間がいちばん知りたいのは、main やワークフローを変えようとした試み）。
+# 記録でボリュームを埋められないよう、10MB を超えたら拒否は書かない（受け付けた更新は書く）
+reject() {
+  log_file="$(git rev-parse --git-dir)/push-gate.log"
+  if [ "$({ wc -c < "$log_file"; } 2>/dev/null || echo 0)" -lt 10485760 ]; then
+    printf '%s REJECTED %s\n' "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$log_file" 2>/dev/null || true
+  fi
+  echo "git-push-gate: $*" >&2; exit 1
+}
+reject_if_signaled() { [ -z "$got_signal" ] || reject "中断されました（シグナルを受けた）"; }
+# ゲートのリポジトリ（直前に GitHub から fetch したもの）での、ブランチの先端のコミット。なければ空。
+# ブランチは名前どおりに引く（rev-parse はないと refs/tags/... などに読み替えるので使わない）
+fetched_tip() { git show-ref --verify --hash "$1" 2>/dev/null || true; }
+# 小文字にする。tr が止まると空になるので、長さが変わらないことを確かめる。$(...) の中で呼ぶので、呼び出し側でも || reject する
+to_lower() {
+  lowered=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') && [ "${#lowered}" -eq "${#1}" ] || reject "小文字に変換できません"
+  printf '%s' "$lowered"
+}
+is_object_id() { [ "${#1}" -eq 40 ] && case "$1" in *[!0-9a-f]*) false ;; esac; }
+
+# --- 設定 ---
+# 保護ブランチなどは entrypoint がリポジトリの設定に書き込む（sshd 経由では環境変数が届かないため）
+PROTECTED_BRANCHES=$(git config --get gate.protected) || PROTECTED_BRANCHES=""
+# 制限なしは entrypoint が「*」と書き込む。読めないとき（設定がないときも）は拒否する（制限なしと取り違えない）
+ALLOWED_PREFIXES=$(git config --get gate.allowedPrefixes) && [ -n "$ALLOWED_PREFIXES" ] || reject "gate.allowedPrefixes を読めません"
+[ "$ALLOWED_PREFIXES" != "*" ] || ALLOWED_PREFIXES=""
+# shellcheck disable=SC2086
+set -- $PROTECTED_BRANCHES
+[ $# -gt 0 ] || reject "gate.protected が設定されていないか、空です"
+PROTECTED_BRANCHES_LOWER=$(to_lower "$PROTECTED_BRANCHES") || reject "小文字に変換できません"
+# 下の .github の比較は、木が正しい形（項目が並んでいて重複がない）であることを前提にしている。
+# 並びの壊れた木では ls-tree に .github が見えず、比較をすり抜けるので、fsck が無効なら受け付けない
+[ "$(git config --bool --get receive.fsckObjects || true)" = true ] || reject "receive.fsckObjects が有効ではありません"
+# 変な mode（40777 や 100600 など）は ls-tree が正規化して表示し、比較では同じに見えるので、fsck で拒否させる
+[ "$(git config --get receive.fsck.badFilemode || true)" = error ] || reject "receive.fsck.badFilemode が error ではありません"
+# push 証明書は使わない（案内していなくても receive-pack は受け取ってしまう）
+[ -z "${GIT_PUSH_CERT:-}" ] || reject "push 証明書（--signed）は使えません"
+# 名前を間違えた保護ブランチは何も守らないので、GitHub にない保護ブランチがあれば受け付けない（直前に fetch 済み）
+for branch in $PROTECTED_BRANCHES; do
+  [ -n "$(fetched_tip "refs/heads/$branch")" ] || reject "保護ブランチ $branch が GitHub にありません。PROTECTED_BRANCHES を確認してください"
+done
+
+# --- ワークフローと複合アクションの検査 ---
+# ワークフローと複合アクションは、エージェントには変更させない（人間が push する）。
+# 許すのは、保護ブランチのどれか 1 つと同じ内容だけ（ワークフローのファイルを消すのは可）。
+# 中身は解析しない（GitHub のパーサーとの解釈の違いや、PR のマージコミットで組み合わされた内容を
+# 突かれるため）。履歴（親や分岐点）も使わない（エージェントが自由に作れるため）。
+# push 先の今の内容も基準にしない。人間が試しているワークフロー（保護していないブランチ）や、
+# 人間が直す前の古い版の上に、エージェントのコードを載せて動かせてしまうため
+WORKFLOWS_DIR=.github/workflows
+# git の失敗を「項目なし」と取り違えないよう、どれも失敗したら拒否する（github_dirs_are_trees などは if や || の中で
+# 呼ばれ、set -e が効かないため、明示的に確かめる）
+# tree_entry コミット パス: そのパスの項目（mode type oid と、引用符付きのパス）。なければ空
+tree_entry() { git ls-tree "$1" -- "$2" || reject "$1 の $2 を読めません"; }
+# ディレクトリでないもの（シンボリックリンクなど）だと中身を列挙できず、比較をすり抜けるので拒否
+github_dirs_are_trees() {
+  for path in .github "$WORKFLOWS_DIR"; do
+    entry_line=$(tree_entry "$1" "$path") || exit 1
+    [ -z "$entry_line" ] || [ "${entry_line#040000 tree }" != "$entry_line" ] || return 1
+  done
+}
+# ワークフローのファイルの一覧（ls-tree -r の行）。パスは常に同じ規則で引用されるので、行どうしで比べてよい
+list_workflow_files() { git ls-tree -r "$1" -- "$WORKFLOWS_DIR/" || reject "$1 のワークフローを読めません"; }
+# for_each_line 文字列 関数名: 文字列の各行（空行を除く）について関数を呼ぶ。偽を返したら、そこで偽を返す
+for_each_line() {
+  # 改行で区切った for にする（行ごとに残りの文字列をコピーすると、行の数の 2 乗の時間がかかり、
+  # 大きな木を push されるとロックを持ったまま何時間も動き続ける）。set -f なのでグロブ展開はされない
+  saved_ifs=$IFS; IFS=$NEWLINE
+  for each_line in $1; do
+    IFS=$saved_ifs; "$2" "$each_line" || return 1; IFS=$NEWLINE
+  done
+  IFS=$saved_ifs
+}
+# 大文字・小文字だけが違う .GITHUB や .github/Workflows は、取り違えのもとなので拒否
+is_not_github_variant() { case "$1" in .github) ;; .[gG][iI][tT][hH][uU][bB]) return 1 ;; esac; }
+is_not_subdir_variant() {
+  case "$1" in
+    .github/workflows|.github/actions) ;;
+    .github/[wW][oO][rR][kK][fF][lL][oO][wW][sS]|.github/[aA][cC][tT][iI][oO][nN][sS]) return 1 ;;
+  esac
+}
+has_no_case_variants() {
+  root_names=$(git ls-tree --name-only "$1") || reject "$1 を読めません"
+  for_each_line "$root_names" is_not_github_variant || return 1
+  github_names=$(git ls-tree --name-only "$1" -- .github/) || reject "$1 の .github を読めません"
+  for_each_line "$github_names" is_not_subdir_variant
+}
+# all_lines_allowed 行の一覧 許す行の一覧: 前者のすべての行が後者にあれば真（grep を使わず、シェルだけで比べる）
+is_allowed_line() { case "$NEWLINE$allowed_lines$NEWLINE" in *"$NEWLINE$1$NEWLINE"*) ;; *) return 1 ;; esac; }
+all_lines_allowed() { allowed_lines=$2; for_each_line "$1" is_allowed_line; }
+# check_commit ref コミット: push されたコミットの .github を検査する。通らなければ拒否して終わる
+check_commit() {
+  # ブランチにはコミットだけを置かせる（注釈付きタグのオブジェクトなども ls-tree は中を見てしまう）
+  [ "$(git cat-file -t "$2" 2>/dev/null || true)" = commit ] || reject "$1: コミット以外は push できません"
+  github_dirs_are_trees "$2" || reject "$1: .github か .github/workflows がディレクトリではありません"
+  has_no_case_variants "$2" || reject "$1: 大文字・小文字だけが違う .github / workflows / actions は使えません"
+  pushed_workflows=$(list_workflow_files "$2") || exit 1
+  pushed_actions=$(tree_entry "$2" .github/actions) || exit 1
+  for branch in $PROTECTED_BRANCHES; do
+    protected_tip=$(fetched_tip "refs/heads/$branch"); github_dirs_are_trees "$protected_tip" || continue
+    # [ ] や if の中のコマンド置換では、読めないときの reject がサブシェルを抜けるだけで空と比べてしまうので、先に変数に入れる
+    protected_actions=$(tree_entry "$protected_tip" .github/actions) || exit 1
+    [ "$pushed_actions" = "$protected_actions" ] || continue
+    protected_workflows=$(list_workflow_files "$protected_tip") || exit 1
+    if all_lines_allowed "$pushed_workflows" "$protected_workflows"; then return 0; fi
+  done
+  reject "$1: .github/workflows か .github/actions が、どの保護ブランチとも一致しないため拒否。main に rebase するか、人間が push してください"
+}
+
+# --- 受け取った更新を 1 行ずつ検査する ---
+set --   # GitHub に push するときの引数（--force-with-lease と push の指定）を、ここに足していく
+accepted_log=""; ref_count=0; created_or_updated_branches=""
+while IFS= read -r update_line; do
+  # 1 回の push の ref の数に上限を付ける（数が多いと判定に時間がかかり、確かめた GitHub の状態が古くなる）
+  ref_count=$((ref_count + 1)); [ "$ref_count" -le 50 ] || reject "一度に push できる ref は 50 個までです。分けて push してください"
+  # 印字できる ASCII 以外を含む行は、記録やメッセージに名前を出さずに拒否する。制御文字（端末の制御シーケンス）のほか、
+  # UTF-8 の C1 制御文字（U+009B は CSI として働く）や、表示の向きを変える文字（U+202E など。…/Main に見せかける）も含む
+  # 「すべてが印字できる ASCII か」を確かめる形にする（grep 自体が失敗しても拒否になるように）
+  printf '%s\n' "$update_line" | LC_ALL=C grep -qx '[ -~]*' || reject "不正な更新の指定です（制御文字か、ASCII 以外の文字を含む）"
+  # 長すぎる名前も、記録に書かずに拒否する（記録でボリュームを埋められないように）。82 は old と new と空白 2 つ
+  [ "${#update_line}" -le $((82 + 255)) ] || reject "不正な更新の指定です（ref 名が 255 バイトを超えている）"
+  # 行をそのまま読み、「old new ref」の形でなければ拒否する（read で区切ると、末尾の空白などが取り除かれ、
+  # receive-pack が後で拒否する名前を、整えた名前で GitHub に push してしまう）
+  old_oid=${update_line%% *}; rest=${update_line#* }; new_oid=${rest%% *}; ref=${rest#* }
+  [ "$update_line" = "$old_oid $new_oid $ref" ] && [ "$ref" = "${ref%%[[:space:]]*}" ] || reject "不正な更新の指定です"
+  # receive-pack は ref 名を検査する前にフックへ渡すので、行の形式から確かめる（改行を埋め込んだ ref 名など）
+  is_object_id "$old_oid" && is_object_id "$new_oid" || reject "不正な更新の指定です"
+  case "$ref" in
+    refs/heads/*) ;;
+    *) reject "$ref は許可されていません（ブランチのみ）" ;;
+  esac
+  git check-ref-format "$ref" || reject "$ref は不正なブランチ名です"
+  branch_name=${ref#refs/heads/}
+  # 使える文字を限る。$ ` ; | ( ) などを含む名前は、人間が書いたワークフローで
+  # ${{ github.head_ref }} をそのままコマンドに埋め込んでいると、コマンドとして実行されてしまう
+  printf '%s\n' "$branch_name" | grep -Eqx '[A-Za-z0-9._/-]+' || reject "$ref は使えない文字を含みます（使えるのは英数字と . _ / -）"
+  # 人間やツールが取り違える名前（HEAD、refs/tags/v1 のようにタグや別の ref に見えるもの）は作らせない。
+  # 40 桁の 16 進数の名前は、push の指定でコミット ID と取り違えられる（検査したものと別のものが push される）
+  # （git はコミット ID の大文字・小文字を区別しないので、大文字も）
+  # - で始まる名前はオプションと取り違えられる。heads/main や tags/v1 は、短い名前で引くとブランチやタグに見える
+  branch_name_lower=$(to_lower "$branch_name") || exit 1
+  case "$branch_name_lower" in
+    # 途中の /refs/ や末尾の /HEAD も、ls-remote などの末尾での一致で refs/heads/main や HEAD に見える
+    head|refs/*|heads/*|tags/*|remotes/*|pull/*|-*|*/refs/*|*/head) reject "$ref は紛らわしい名前のため拒否" ;;
+  esac
+  if is_object_id "$branch_name_lower"; then reject "$ref は紛らわしい名前のため拒否"; fi
+  # 保護ブランチ（大文字・小文字だけが違う Main なども含む）
+  case " $PROTECTED_BRANCHES_LOWER " in *" $branch_name_lower "*) reject "$ref への push は禁止" ;; esac
+  # 許可する接頭辞（ALLOWED_BRANCH_PREFIXES）が設定されていれば、それ以外のブランチは作成・更新・削除させない
+  if [ -n "$ALLOWED_PREFIXES" ]; then
+    prefix_matched=no
+    for prefix in $ALLOWED_PREFIXES; do [ "${branch_name#"$prefix"}" = "$branch_name" ] || prefix_matched=yes; done
+    [ "$prefix_matched" = yes ] || reject "$ref は許可された接頭辞（$ALLOWED_PREFIXES）で始まっていません"
+  fi
+
+  # 直前に fetch した GitHub の値を lease にする（その間に誰かが push していたら失敗）。
+  # クライアントが送ってきた old は信用せず、fetch した値と一致することを確かめる
+  fetched_oid=$(fetched_tip "$ref")
+  [ "$old_oid" = "${fetched_oid:-$ZERO_OID}" ] || reject "$ref は GitHub 側で更新されています。fetch してからやり直してください"
+  if [ "$new_oid" = "$ZERO_OID" ]; then
+    # ないブランチの削除は、何もしないのに受け付けた記録が残る（上限のない記録を増やせる）ので拒否
+    [ -n "$fetched_oid" ] || reject "$ref は GitHub にありません"
+    push_spec=":$ref"                       # ブランチ削除
+  else
+    check_commit "$ref" "$new_oid"
+    push_spec="$new_oid:$ref"
+    # 同じ名前のタグがないかを後で確かめる（削除は紛らわしさをなくすので許す）
+    created_or_updated_branches="$created_or_updated_branches $branch_name"
+  fi
+  set -- "$@" "--force-with-lease=$ref:$fetched_oid" "$push_spec"
+  accepted_log="$accepted_log$(date --utc +%Y-%m-%dT%H:%M:%SZ) $ref $old_oid $new_oid
+"
+  reject_if_signaled
+done
+# read の最中にシグナルを受けると、ループが途中で終わる
+reject_if_signaled
+# receive-pack は更新がなければフックを呼ばないので、0 件は何かがおかしい（成功にすると、検査していない ref が手元に残る）
+[ $# -gt 0 ] || reject "更新の指定がありません"
+
+# --- GitHub の今の状態を確かめる ---
+# push する直前に 1 回だけ確かめる。判定は受け付けの前に fetch した値で行ったので、
+# 保護ブランチがその値のままであることを確かめれば、データを送り終えるまで（最大 10 分）と判定の間に
+# 人間がワークフローを直した場合を、まとめて拒否できる。残る隙間は、この後の GitHub への push の間（最大 5 分）だけ。
+# タグは push するブランチと同じ名前のものだけを問い合わせる（ゲートはタグを fetch しない）
+# shellcheck disable=SC2046,SC2086
+github_refs=$(timeout 60 git ls-remote --symref upstream HEAD \
+  $(for branch in $PROTECTED_BRANCHES; do printf 'refs/heads/%s ' "$branch"; done) \
+  $(for branch in $created_or_updated_branches; do printf 'refs/tags/%s ' "$branch"; done)) \
+  || reject "GitHub の状態を確かめられません"
+# ls-remote の出力は「oid<タブ>ref」の行（HEAD の向き先は「ref: refs/heads/main<タブ>HEAD」）。
+# ref は末尾の一致で余分に返ることがあるので、タブから行末までの完全一致で引く（awk などは使わない）
+github_has_ref() { case "$NEWLINE$github_refs$NEWLINE" in *"$TAB$1$NEWLINE"*) ;; *) return 1 ;; esac; }
+github_ref_value() { # github_ref_value ref: その ref の行の、タブより前（oid か「ref: …」）。なければ空
+  before_match=$NEWLINE$github_refs$NEWLINE; before_match=${before_match%%"$TAB$1$NEWLINE"*}
+  [ "$before_match" != "$NEWLINE$github_refs$NEWLINE" ] || return 0
+  printf '%s' "${before_match##*"$NEWLINE"}"
+}
+for branch in $PROTECTED_BRANCHES; do
+  github_oid=$(github_ref_value "refs/heads/$branch"); fetched_oid=$(fetched_tip "refs/heads/$branch")
+  is_object_id "$github_oid" && [ "$github_oid" = "$fetched_oid" ] \
+    || reject "保護ブランチ $branch が、受け付けを始めた後に GitHub で更新されました。やり直してください"
+done
+# デフォルトブランチ（master や trunk のこともある）が保護されていなければ受け付けない。
+# HEAD の行は 2 つ（向き先と oid）あるので、最初の「ref: refs/heads/…」を取る
+default_branch=$(github_ref_value HEAD)
+default_branch=${default_branch#ref: refs/heads/}
+case "$default_branch" in ''|ref:*|*[!A-Za-z0-9._/-]*) reject "GitHub のデフォルトブランチを確かめられません" ;; esac
+case " $PROTECTED_BRANCHES " in
+  *" $default_branch "*) ;;
+  *) reject "デフォルトブランチ $default_branch が PROTECTED_BRANCHES に入っていません" ;;
+esac
+# GitHub にある同じ名前のタグ（v1.2.3 など）。短い名前で引くツール（git clone --branch、uses: owner/repo@v1 など）が
+# ブランチの方を取ることがある
+for branch in $created_or_updated_branches; do
+  if github_has_ref "refs/tags/$branch"; then reject "refs/heads/$branch は GitHub にある同じ名前のタグと紛らわしいため拒否"; fi
+done
+
+# --- GitHub に push する ---
+reject_if_signaled
+timeout 300 git push --atomic --quiet upstream "$@" \
+  || reject "GitHub への push に失敗しました（時間切れを含む。時間切れのときは GitHub に反映されていることがあるので、fetch して確かめてください）"
+# 受け付けた更新の記録（人間が後で確かめられるように）。GitHub への push が成功したものだけ
+# （書き込みに失敗しても、GitHub には push 済みなので、クライアントには成功を返す）
+printf '%s' "$accepted_log" >> "$(git rev-parse --git-dir)/push-gate.log" || echo "git-push-gate: 警告: 記録を書き込めませんでした" >&2

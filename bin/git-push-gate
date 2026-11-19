@@ -1,0 +1,57 @@
+#!/bin/sh
+# authorized_keys の command= から呼ばれる。許可するのは push（git-receive-pack）だけ。
+# SSH_ORIGINAL_COMMAND 以外の環境変数はクライアントから渡せない（sshd の AcceptEnv 既定値）。
+set -eu
+# オプションはなるべく長い形で書く（短い形のままのものは、busybox や git に長い形がないもの）
+# GIT_PUSH_GATE_REPO はテスト用。sshd から呼ばれたとき（SSH_CONNECTION がある）は使わない
+if [ -n "${SSH_CONNECTION:-}" ]; then REPO=/srv/git/repo.git; else REPO="${GIT_PUSH_GATE_REPO:-/srv/git/repo.git}"; fi
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  "git-receive-pack '/repo.git'"|"git-receive-pack 'repo.git'") ;;
+  *) # 記録にはコマンドの中身を書かない（制御文字などを書き込ませない）。ロックの前なので何度でも呼べる。
+     # 記録でボリュームを埋められないよう、10MB を超えたら書かない
+     if [ "$({ wc -c < "$REPO/push-gate.log"; } 2>/dev/null || echo 0)" -lt 10485760 ]; then
+       printf '%s REJECTED 許可されていないコマンド（push 以外）\n' "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" >> "$REPO/push-gate.log" 2>/dev/null || true
+     fi
+     echo "git-push-gate: このコマンドは許可されていません（push のみ）" >&2; exit 1 ;;
+esac
+
+# パスフレーズ付きの鍵がまだ unlock されていなければ、分かりやすいエラーで止める
+AGENT_SOCKET=$(git --git-dir="$REPO" config --get gate.agentSocket || true)
+if [ -n "$AGENT_SOCKET" ] && ! SSH_AUTH_SOCK="$AGENT_SOCKET" ssh-add -l >/dev/null 2>&1; then
+  echo "git-push-gate: GitHub 用の鍵がロックされています。人間がホストで docker compose exec git-push-gate unlock を実行してください" >&2
+  exit 1
+fi
+
+# 同時 push を直列化（fd 9 は receive-pack に引き継がれ、終了までロックを保持）
+exec 9>"$REPO/push-gate.lock"
+flock --timeout 300 9 || { echo "git-push-gate: ほかの push が終わらないため中止しました" >&2; exit 1; }
+
+# GitHub の最新状態を反映してから受け付ける。
+# これでクライアント側の fast-forward 判定と、pre-receive の lease が GitHub と一致する。
+# 整理（gc）。fetch や receive-pack の中では止めていて、フックの中では一時領域しか見ないので、ここで行う
+git -c gc.autoDetach=false --git-dir="$REPO" gc --auto --quiet || echo "git-push-gate: 警告: gc に失敗しました" >&2
+# 止まった receive-pack（時間切れ、接続の切断、メモリ不足）が残した受け取りかけのデータを消す。
+# ロックを持っているので、使っている途中のものはない（動き続けているフックも、ロックを持ったまま）
+rm -rf "$REPO"/objects/tmp_objdir-incoming-*
+# receive-pack は push 証明書を、受け付ける大きさの上限と関係なく、フックより前に本体のオブジェクト置き場に書く
+# （拒否した push でも残る）。ゲートは受け取ったものを常にパックのまま置く（fetch.unpackLimit と receive.unpackLimit を 1 にしている）ので、
+# 緩いオブジェクトはどれも使われていないもの。一時ファイルと合わせて 100MB を超えたら消す
+unused_kib=$(git --git-dir="$REPO" count-objects --verbose 2>/dev/null | awk '$1 == "size:" || $1 == "size-garbage:" { total += $2 } END { print total + 0 }')
+[ "${unused_kib:-0}" -lt 102400 ] || git --git-dir="$REPO" prune --expire=now || echo "git-push-gate: 警告: prune に失敗しました" >&2
+# 一度も fetch できていなければ（起動時の fetch の失敗など）、全履歴を取るので時間制限を長くする。
+# 時間切れの fetch は途中から再開しないので、人間が大きな push をした後でも足りるよう、余裕を持たせる
+if [ -n "$(git --git-dir="$REPO" for-each-ref --count=1 refs/heads/)" ]; then fetch_timeout=600; else fetch_timeout=1800; fi
+# 裏で起動する gc や保守処理は、ロックのファイル記述子（fd 9）を引き継いで次の push を待たせるので止める
+timeout "$fetch_timeout" git -c gc.auto=0 -c maintenance.auto=false --git-dir="$REPO" fetch --prune --no-tags --quiet upstream '+refs/heads/*:refs/heads/*' \
+  || { echo "git-push-gate: GitHub から fetch できません（時間切れを含む。続くときは、人間がゲートを再起動してください）" >&2; exit 1; }
+
+# 止まったクライアントがロックを持ち続けないよう、受け付けの時間に上限を付ける。
+# 上限で止まるのは receive-pack だけで、GitHub への push（pre-receive の中、別に 300 秒の上限）は
+# 終わっていることがある。クライアントには失敗と返るので、fetch して確かめること
+# CPU 時間にも上限を付ける（receive-pack が時間切れで止まっても、フックは動き続けることがあるため。
+# 複数のスレッドの合計で数えるので、正しい大きな push が当たらないよう余裕を持たせる）。
+# シグナルで止まったときのコアダンプは書かない（リポジトリの中に置かれうる）
+ulimit -t 3600
+ulimit -c 0
+exec timeout 600 git-receive-pack "$REPO"

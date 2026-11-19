@@ -1,0 +1,27 @@
+# 利用側プロジェクトの .devcontainer/compose.yaml の例
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/base:trixie
+    command: sleep infinity
+    volumes:
+      - ..:/workspaces/app:cached
+    # docker.sock はマウントしない（git-push-gate コンテナの中身を読めてしまう）
+
+  git-push-gate:
+    # GitHub に書き込める鍵を持つ部品なので、本番ではタグかコミットの SHA に固定する（#main は動き続ける）
+    build: https://github.com/tksugimoto/git-push-gate.git#main
+    environment:
+      UPSTREAM: git@github.com:OWNER/REPO.git
+      # PROTECTED_BRANCHES: "main develop"   # 既定。すべて GitHub にないと push を受け付けないので、develop がなければ "main" にする
+      # UNLOCK_LIFETIME: 8h   # パスフレーズ付きの鍵を解除しておく時間（既定は無期限）
+      # MAX_PUSH_SIZE: 500m   # 1 回の push で受け付ける大きさの上限（既定 500m）
+      # ALLOWED_BRANCH_PREFIXES: "agent/"   # この接頭辞のブランチしか作成・更新・削除させない
+    # 使えるメモリの上限（エージェントが大きなデータを送って、ホストのメモリを使い切らないように）。リポジトリが大きければ増やす
+    mem_limit: 2g
+    volumes:
+      # ワークスペースの外に置くこと（dev コンテナから読めない場所）
+      - ${HOME}/.config/git-push-gate/REPO:/config:ro
+      - git-push-gate-data:/srv/git
+
+volumes:
+  git-push-gate-data:

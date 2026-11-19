@@ -1,0 +1,29 @@
+# 利用側のリポジトリを変更せずに使う場合の例（devcontainer が image / Dockerfile 方式で、compose を使わないとき）。
+# ワークスペースの外（例: ~/.config/git-push-gate/REPO/compose.yaml）に置き、ホストで docker compose up --detach する。
+# 同じディレクトリに config/（github_key, known_hosts, client_keys.pub など）を置く。
+# devcontainer の設定は、devcontainer の中で client/setup.sh を実行する（README を参照）。
+services:
+  git-push-gate:
+    # GitHub に書き込める鍵を持つ部品なので、本番ではタグかコミットの SHA に固定する（#main は動き続ける）
+    build: https://github.com/tksugimoto/git-push-gate.git#main
+    restart: unless-stopped
+    environment:
+      UPSTREAM: git@github.com:OWNER/REPO.git
+      # PROTECTED_BRANCHES: "main develop"   # 既定。すべて GitHub にないと push を受け付けないので、develop がなければ "main" にする
+      # UNLOCK_LIFETIME: 8h   # パスフレーズ付きの鍵を解除しておく時間（既定は無期限）
+      # MAX_PUSH_SIZE: 500m   # 1 回の push で受け付ける大きさの上限（既定 500m）
+      # ALLOWED_BRANCH_PREFIXES: "agent/"   # この接頭辞のブランチしか作成・更新・削除させない
+    # 使えるメモリの上限（エージェントが大きなデータを送って、ホストのメモリを使い切らないように）。リポジトリが大きければ増やす
+    mem_limit: 2g
+    ports:
+      # 公開先のアドレスは環境で変える（.env に GATE_BIND=172.17.0.1 のように書く）
+      #   Docker Desktop（Mac / Windows。WSL2 バックエンドを含む）: 127.0.0.1（既定）
+      #   Linux・WSL に直接入れた Docker Engine: docker0 の IP（多くは 172.17.0.1）
+      # 0.0.0.0 にはしないこと（LAN に公開される）
+      - "${GATE_BIND:-127.0.0.1}:${GATE_PORT:-2222}:22"
+    volumes:
+      - ./config:/config:ro
+      - data:/srv/git
+
+volumes:
+  data:

@@ -1,0 +1,22 @@
+#!/bin/sh
+# ホストから実行する: docker compose exec git-push-gate unlock
+# パスフレーズ付きの GitHub 用の鍵を、コンテナ内の ssh-agent に読み込ませる（コンテナを止めるまで有効）。
+set -eu
+# オプションはなるべく長い形で書く（su・ssh-add・rm などの短い形は、busybox や OpenSSH に長い形がないもの）
+AGENT_SOCKET=$(git --git-dir=/srv/git/repo.git config --get gate.agentSocket || true)
+if [ -z "$AGENT_SOCKET" ]; then
+  echo "unlock: パスフレーズなしの鍵なので、解除は不要です"
+  exit 0
+fi
+# ssh-agent が止まっていたら（ssh-add -l が 2 = 接続できない）、起動し直す
+list_status=0; su -s /bin/sh git -c "SSH_AUTH_SOCK=$AGENT_SOCKET ssh-add -l" >/dev/null 2>&1 || list_status=$?
+if [ "$list_status" = 2 ]; then
+  echo "unlock: ssh-agent が止まっていたので、起動し直します" >&2
+  rm -f "$AGENT_SOCKET"
+  su -s /bin/sh git -c "ssh-agent -a $AGENT_SOCKET" >/dev/null
+fi
+# UNLOCK_LIFETIME（例: 8h）を指定すると、その時間で自動的に再ロックされる
+su -s /bin/sh git -c "SSH_AUTH_SOCK=$AGENT_SOCKET ssh-add ${UNLOCK_LIFETIME:+-t $UNLOCK_LIFETIME} /home/git/.ssh/github_key"
+# 最初の fetch（全履歴）は時間がかかるので、push の前に時間制限なしで済ませておく
+su -s /bin/sh git -c "flock /srv/git/repo.git/push-gate.lock git -c gc.auto=0 -c maintenance.auto=false --git-dir=/srv/git/repo.git fetch --prune --no-tags --quiet upstream '+refs/heads/*:refs/heads/*'" \
+  || echo "unlock: 警告: GitHub から fetch できません（UPSTREAM・鍵・known_hosts を確認してください）" >&2
