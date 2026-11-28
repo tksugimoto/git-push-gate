@@ -73,6 +73,11 @@ wait_ssh() { # wait_ssh ホスト名 コンテナ → known_hosts の行を出�
 }
 wait_ssh github.com "$CONTAINER_PREFIX-github" > "$WORK_DIR/config/known_hosts"
 
+# ゲートを通る push 用に、保護ブランチ main の .github/workflows/ci.yml を取り出しておく。
+# エージェントのブランチの .github は保護ブランチと完全に同一でないと拒否されるので（空や部分集合は不可）、
+# clone せずに作るブランチ（下の bridge / viacompose / viasetup）には、この版をそのまま同梱する
+docker exec "$CONTAINER_PREFIX-github" git --git-dir=/home/git/repo.git show main:.github/workflows/ci.yml > "$WORK_DIR/gate_ci.yml"
+
 start_gate() { # start_gate 鍵ファイル名 [追加の docker run 引数...]
   key_file=$1; shift
   docker rm --force "$CONTAINER_PREFIX-gate" >/dev/null 2>&1 || true
@@ -124,7 +129,7 @@ check "コンテナを作り直してもホスト鍵が変わらない" 'cmp "$W
 GATE_PORT=$(docker port "$CONTAINER_PREFIX-gate" 22/tcp | sed 's/.*://' | head -n1)
 check "既定の bridge からゲートウェイ経由で push できる" 'RUN_NETWORK=bridge run "set -e
     gateway=\$(ip route | awk \"/default/{print \\\$3}\")
-    git init --quiet --initial-branch bridge /tmp/d && cd /tmp/d && $(commit x)
+    git init --quiet --initial-branch bridge /tmp/d && cd /tmp/d && mkdir -p .github/workflows && cp /w/gate_ci.yml .github/workflows/ci.yml && git add .github/workflows/ci.yml && $(commit x)
     GIT_SSH_COMMAND='"'"'$CLIENT_SSH -o HostKeyAlias=gate'"'"' git push --quiet ssh://git@\$gateway:$GATE_PORT/repo.git bridge" >"$WORK_DIR/out" 2>&1 && gh_has bridge'
 
 # トップの compose.yaml: clone したディレクトリに .env と config/ を置いて docker compose up する
@@ -156,7 +161,7 @@ check "compose で起動したゲートが、起動時に GitHub を fetch し�
   'compose exec -T git-push-gate git --git-dir=/srv/git/repo.git rev-parse --quiet --verify refs/heads/develop >"$WORK_DIR/out" 2>&1'
 COMPOSE_SSH="ssh -i /w/client/id_ed25519 -o UserKnownHostsFile=/w/known_hosts_compose -o HostKeyAlias=compose-gate"
 check "compose で起動したゲートに、公開したポート経由で push できる" 'RUN_NETWORK=bridge run "set -e
-    git init --quiet --initial-branch viacompose /tmp/d && cd /tmp/d && $(commit x)
+    git init --quiet --initial-branch viacompose /tmp/d && cd /tmp/d && mkdir -p .github/workflows && cp /w/gate_ci.yml .github/workflows/ci.yml && git add .github/workflows/ci.yml && $(commit x)
     GIT_SSH_COMMAND='"'"'$COMPOSE_SSH'"'"' git push --quiet ssh://git@$BRIDGE_GATEWAY:$COMPOSE_PORT/repo.git viacompose" >"$WORK_DIR/out" 2>&1 && gh_has viacompose'
 check "compose で起動したゲートも、main への push は拒否" '! RUN_NETWORK=bridge run "set -e
     git init --quiet --initial-branch main /tmp/d && cd /tmp/d && $(commit y)
@@ -164,11 +169,13 @@ check "compose で起動したゲートも、main への push は拒否" '! RUN_
 compose down --volumes --rmi local >/dev/null 2>&1
 
 # client/setup.sh: devcontainer に見立てたコンテナの中で実行し、push 先をゲートに向ける
-docker run --detach --name "$CONTAINER_PREFIX-dev" --network "$NETWORK" --volume "$ROOT/client:/client:ro" \
+docker run --detach --name "$CONTAINER_PREFIX-dev" --network "$NETWORK" --volume "$ROOT/client:/client:ro" --volume "$WORK_DIR:/w:ro" \
   --entrypoint sh "$IMAGE" -c 'adduser -D -u 1001 dev && sleep 1000000' >/dev/null
 until docker exec "$CONTAINER_PREFIX-dev" id dev >/dev/null 2>&1; do sleep 1; done
 docker exec --user dev "$CONTAINER_PREFIX-dev" sh -c "mkdir /home/dev/ws && cd /home/dev/ws && git init --quiet --initial-branch viasetup &&
-  git remote add origin https://github.invalid/repo.git && $(commit x | sed 's/git commit/git -c user.name=t -c user.email=t@example.com commit/')"
+  git remote add origin https://github.invalid/repo.git &&
+  mkdir -p .github/workflows && cp /w/gate_ci.yml .github/workflows/ci.yml && git add .github/workflows/ci.yml &&
+  $(commit x | sed 's/git commit/git -c user.name=t -c user.email=t@example.com commit/')"
 gate_host_key=$(docker exec "$CONTAINER_PREFIX-gate" cat /srv/git/ssh_host_keys/ssh_host_ed25519_key.pub)
 setup() { docker exec --user dev --workdir /home/dev/ws "$CONTAINER_PREFIX-dev" sh /client/setup.sh gate 22 "$gate_host_key"; }
 check "git のリポジトリの外では、何も書かずに止まる" \

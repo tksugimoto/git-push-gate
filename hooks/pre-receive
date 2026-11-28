@@ -66,12 +66,24 @@ done
 
 # --- ワークフローと複合アクションの検査 ---
 # ワークフローと複合アクションは、エージェントには変更させない（人間が push する）。
-# 許すのは、保護ブランチのどれか 1 つと同じ内容だけ（ワークフローのファイルを消すのは可）。
+# 許すのは、保護ブランチのどれか 1 つと「完全に同一」の内容だけ。ファイルを 1 つでも消したり、
+# 一部だけを持ち込んだりした一覧（部分集合）は許さない。欠けた一覧は、PR のマージで別のブランチの
+# 版と継ぎ合わせて、誰も書いていないワークフローを組み立てる材料になるため（rename で別のパスから
+# ワークフローの位置に持ち込む手口を含む）。
+# さらに、先端のコミットだけでなく、この push が「新しく持ち込むコミット」すべてについて確かめる。
+# PR のマージコミット（refs/pull/N/merge）は、先端だけを見ていては検査されない中間コミットや
+# 分岐点（マージベース）の中身を継ぎ合わせられるため。先端だけの検査では、この材料を縛れない。
 # 中身は解析しない（GitHub のパーサーとの解釈の違いや、PR のマージコミットで組み合わされた内容を
-# 突かれるため）。履歴（親や分岐点）も使わない（エージェントが自由に作れるため）。
+# 突かれるため）。
+# 履歴（親や分岐点）の「位置」は信用しない（エージェントが自由に作れるため）。ただし、ここで確かめるのは
+# 各コミットの「中身」であって、それがどこに置かれているか（位置）ではない。位置を信用しないことと、
+# すべての新しいコミットの中身を確かめることは別のこと。
 # push 先の今の内容も基準にしない。人間が試しているワークフロー（保護していないブランチ）や、
 # 人間が直す前の古い版の上に、エージェントのコードを載せて動かせてしまうため
 WORKFLOWS_DIR=.github/workflows
+# 1 回の push で新しく持ち込めるコミットの数の上限。これを超える巨大な履歴は、1 コミットずつの検査が
+# ロックを持ったまま長時間かかるので、拒否する（CLOSED に倒す）。通常の作業では十分に大きい
+NEW_COMMIT_LIMIT=5000
 # git の失敗を「項目なし」と取り違えないよう、どれも失敗したら拒否する（github_dirs_are_trees などは if や || の中で
 # 呼ばれ、set -e が効かないため、明示的に確かめる）
 # tree_entry コミット パス: そのパスの項目（mode type oid と、引用符付きのパス）。なければ空
@@ -95,40 +107,96 @@ for_each_line() {
   done
   IFS=$saved_ifs
 }
-# 大文字・小文字だけが違う .GITHUB や .github/Workflows は、取り違えのもとなので拒否
-is_not_github_variant() { case "$1" in .github) ;; .[gG][iI][tT][hH][uU][bB]) return 1 ;; esac; }
+# 大文字・小文字だけが違う .GITHUB や .github/Workflows は、取り違えのもとなので拒否。
+# ASCII 以外も拒否する。.github/actionſ（ſ は U+017F で APFS では s と同じ扱い）や .gıthub（ı は U+0131 で NTFS では I に
+# 大文字化される）のような Unicode の変種は、大文字小文字・正規化の規則を網羅できないので、守る場所（ルートと .github 直下）の
+# 名前は、印字できる ASCII だけのものに限る。ls-tree は core.quotePath=false で読み、名前を生のバイトで見る
+# （既定だと "\305\277" のような引用符付きの ASCII になる）。引用符付きになる名前（" \ や制御文字を含むもの）も拒否する。
+# 範囲 [ -~] はロケールで意味が変わるので、LC_ALL=C に固定してバイト単位で比べる
+LC_ALL=C; export LC_ALL
+is_plain_ascii_name() { case "$1" in ''|*[!\ -~]*|*\"*|*\\*) return 1 ;; esac; }
+is_not_github_variant() {
+  is_plain_ascii_name "$1" || return 1
+  case "$1" in .github) ;; .[gG][iI][tT][hH][uU][bB]) return 1 ;; esac
+}
 is_not_subdir_variant() {
+  is_plain_ascii_name "$1" || return 1
   case "$1" in
     .github/workflows|.github/actions) ;;
     .github/[wW][oO][rR][kK][fF][lL][oO][wW][sS]|.github/[aA][cC][tT][iI][oO][nN][sS]) return 1 ;;
   esac
 }
 has_no_case_variants() {
-  root_names=$(git ls-tree --name-only "$1") || reject "$1 を読めません"
+  root_names=$(git -c core.quotePath=false ls-tree --name-only "$1") || reject "$1 を読めません"
   for_each_line "$root_names" is_not_github_variant || return 1
-  github_names=$(git ls-tree --name-only "$1" -- .github/) || reject "$1 の .github を読めません"
+  github_names=$(git -c core.quotePath=false ls-tree --name-only "$1" -- .github/) || reject "$1 の .github を読めません"
   for_each_line "$github_names" is_not_subdir_variant
 }
-# all_lines_allowed 行の一覧 許す行の一覧: 前者のすべての行が後者にあれば真（grep を使わず、シェルだけで比べる）
-is_allowed_line() { case "$NEWLINE$allowed_lines$NEWLINE" in *"$NEWLINE$1$NEWLINE"*) ;; *) return 1 ;; esac; }
-all_lines_allowed() { allowed_lines=$2; for_each_line "$1" is_allowed_line; }
-# check_commit ref コミット: push されたコミットの .github を検査する。通らなければ拒否して終わる
+# actions と workflows は同じ 1 つの保護ブランチのものと一致していなければならない（別々のブランチの
+# 組み合わせは不可）ので、両者を 1 つの「レコード」にまとめて、保護ブランチのレコードと完全一致するかを見る。
+# GITHUB_SET_MARK はレコード内（actions と workflows の間）の区切り、GITHUB_SET_SEP はレコード間の区切り。
+# どちらも ls-tree の行（先頭が mode でタブを含む）には現れない形なので、中身と取り違えない
+GITHUB_SET_MARK=':::git-push-gate actions/workflows 区切り:::'
+GITHUB_SET_SEP=':::git-push-gate 保護セット境界:::'
+# github_set_record actions workflows: 1 コミット分のレコードを作る（$(...) で呼ぶので末尾改行は落ちるが、
+# 保護側・push 側の両方で同じ関数を使うので、落ち方もそろう）
+github_set_record() { printf '%s\n%s\n%s' "$1" "$GITHUB_SET_MARK" "$2"; }
+# 保護ブランチのレコードを、コミットの検査の前に 1 回だけ作る（コミットごとに読み直すと、たくさんの
+# コミットを含む push でロックを持ったまま長時間動き続けるため）。各レコードを SEP で挟んでつなぐ。
+# .github がディレクトリでない保護ブランチは、中身を列挙できないので、基準から外す（= 一致させない）
+PROTECTED_GITHUB_SETS=""
+for branch in $PROTECTED_BRANCHES; do
+  protected_tip=$(fetched_tip "refs/heads/$branch"); github_dirs_are_trees "$protected_tip" || continue
+  # [ ] や if の中のコマンド置換では、読めないときの reject がサブシェルを抜けるだけになるので、先に変数に入れる
+  protected_actions=$(tree_entry "$protected_tip" .github/actions) || exit 1
+  protected_workflows=$(list_workflow_files "$protected_tip") || exit 1
+  protected_record=$(github_set_record "$protected_actions" "$protected_workflows") || reject "保護ブランチ $branch の .github を読めません"
+  PROTECTED_GITHUB_SETS="$PROTECTED_GITHUB_SETS$GITHUB_SET_SEP$NEWLINE$protected_record$NEWLINE"
+done
+PROTECTED_GITHUB_SETS="$PROTECTED_GITHUB_SETS$GITHUB_SET_SEP"
+# github_set_is_protected レコード: そのレコードが保護ブランチのどれかと完全一致すれば真（case だけで比べる）。
+# どのレコードも SEP で挟まれているので、SEP レコード SEP の形で引けば、部分集合は一致しない
+github_set_is_protected() {
+  case "$PROTECTED_GITHUB_SETS" in
+    *"$GITHUB_SET_SEP$NEWLINE$1$NEWLINE$GITHUB_SET_SEP"*) ;;
+    *) return 1 ;;
+  esac
+}
+# check_commit ref コミット: そのコミット 1 つの .github を検査する。通らなければ拒否して終わる。
+# 見るのはコミットの「中身」。履歴のどこに置かれているか（位置）は見ない（上記）
 check_commit() {
   # ブランチにはコミットだけを置かせる（注釈付きタグのオブジェクトなども ls-tree は中を見てしまう）
   [ "$(git cat-file -t "$2" 2>/dev/null || true)" = commit ] || reject "$1: コミット以外は push できません"
   github_dirs_are_trees "$2" || reject "$1: .github か .github/workflows がディレクトリではありません"
-  has_no_case_variants "$2" || reject "$1: 大文字・小文字だけが違う .github / workflows / actions は使えません"
+  has_no_case_variants "$2" || reject "$1: 大文字・小文字だけが違う .github / workflows / actions や、ルートと .github 直下の ASCII 以外（引用符付きになる）名前は使えません"
   pushed_workflows=$(list_workflow_files "$2") || exit 1
   pushed_actions=$(tree_entry "$2" .github/actions) || exit 1
-  for branch in $PROTECTED_BRANCHES; do
-    protected_tip=$(fetched_tip "refs/heads/$branch"); github_dirs_are_trees "$protected_tip" || continue
-    # [ ] や if の中のコマンド置換では、読めないときの reject がサブシェルを抜けるだけで空と比べてしまうので、先に変数に入れる
-    protected_actions=$(tree_entry "$protected_tip" .github/actions) || exit 1
-    [ "$pushed_actions" = "$protected_actions" ] || continue
-    protected_workflows=$(list_workflow_files "$protected_tip") || exit 1
-    if all_lines_allowed "$pushed_workflows" "$protected_workflows"; then return 0; fi
-  done
-  reject "$1: .github/workflows か .github/actions が、どの保護ブランチとも一致しないため拒否。main に rebase するか、人間が push してください"
+  pushed_record=$(github_set_record "$pushed_actions" "$pushed_workflows") || reject "$1: .github を読めません"
+  github_set_is_protected "$pushed_record" \
+    || reject "$1: .github/workflows か .github/actions が、どの保護ブランチとも完全一致しないため拒否。main に rebase するか、人間が push してください"
+}
+# check_new_commits ref 先端のコミット: この push が新しく持ち込むコミットすべてと先端を検査する。
+# 「新しく持ち込むコミット」= 先端から辿れて、ゲートが既に持つ GitHub のブランチのどれからも辿れないもの。
+# 以前は先端だけを見ていたため、PR のマージが、検査していない中間コミットや分岐点（マージベース）の中身を
+# 継ぎ合わせられた。中間コミットが「ブランチが指さないから動かない」のは head の実行の話で、マージベースや
+# rename の材料としては使われるので、そこを塞ぐ。中身の検査は位置と無関係にすべての新しいコミットに及ぶ
+check_new_commit_line() { check_commit "$check_commit_ref" "$1"; }
+check_new_commits() {
+  check_commit_ref=$1
+  # 先端は必ず検査する。既存の ref から辿れる古いコミット（人間が直す前のワークフローを持つ版など）を
+  # 指していても、今の保護ブランチと一致しない版は拒否するため（rev-list では既存 ref 内のコミットは出ない）
+  check_commit "$1" "$2"
+  # --branches は直前に fetch した GitHub のブランチ（refs/heads/*）だけを指す。ゲートはこれしか ref を
+  # 持たず、エージェントはゲート以外で ref を作れない（PR 用のトークンは Contents: read）ので、これが
+  # 「既に GitHub にある＝検査済みか、保護ブランチ由来の人間の版」の集合になる。同じ push 内で先に処理した
+  # 別のブランチはまだ ref になっていないため、その分のコミットも重複して検査される（抜けは生じない）。
+  # 巨大な履歴を持ち込まれてロックを持ったまま止まらないよう、上限を超えたら CLOSED に倒して（拒否して）止める。
+  # まず上限 + 1 個目があるかだけを見て（走査はその分で打ち切られる）、なければ全件を列挙する
+  overflow=$(git rev-list --skip="$NEW_COMMIT_LIMIT" --max-count=1 "$2" --not --branches) \
+    || reject "$1: 新しいコミットを数えられません"
+  [ -z "$overflow" ] || reject "$1: 一度に push できる新しいコミットは $NEW_COMMIT_LIMIT 個までです。分けて push してください"
+  new_commits=$(git rev-list "$2" --not --branches) || reject "$1: 新しいコミットを列挙できません"
+  for_each_line "$new_commits" check_new_commit_line
 }
 
 # --- 受け取った更新を 1 行ずつ検査する ---
@@ -168,6 +236,20 @@ while IFS= read -r update_line; do
     head|refs/*|heads/*|tags/*|remotes/*|pull/*|-*|*/refs/*|*/head) reject "$ref は紛らわしい名前のため拒否" ;;
   esac
   if is_object_id "$branch_name_lower"; then reject "$ref は紛らわしい名前のため拒否"; fi
+  # origin/main や upstream/main のような名前は、ローカルのブランチ refs/heads/origin/main ができると、
+  # git の短い名前の解決が本物のリモート追跡ブランチ refs/remotes/origin/main より先にそちらを選ぶ
+  # （警告が 1 行出るだけ）。人間が origin/main を土台に rebase / merge / reset すると、エージェントのコミットが main に入る。
+  # 『短い名前 X を refs/heads/X が先に奪う』形を塞ぐ。remote の名前（origin・upstream。単独のものも含む）で始まる名前と、
+  # 保護ブランチ名で終わる名前（x/main は、短い名前 main を使う場面や、remote 名が別でも <remote>/main を奪う形になる）を拒否する。
+  # origin-cleanup のように、/ で区切られていない名前は拒否しない。保護ブランチは固定せず、設定から作る
+  case "$branch_name_lower" in
+    origin|upstream|origin/*|upstream/*) reject "$ref は remote 名と紛らわしい名前のため拒否" ;;
+  esac
+  for protected_lower in $PROTECTED_BRANCHES_LOWER; do
+    case "$branch_name_lower" in
+      */"$protected_lower") reject "$ref は保護ブランチ名で終わる紛らわしい名前のため拒否" ;;
+    esac
+  done
   # 保護ブランチ（大文字・小文字だけが違う Main なども含む）
   case " $PROTECTED_BRANCHES_LOWER " in *" $branch_name_lower "*) reject "$ref への push は禁止" ;; esac
   # 許可する接頭辞（ALLOWED_BRANCH_PREFIXES）が設定されていれば、それ以外のブランチは作成・更新・削除させない
@@ -186,7 +268,7 @@ while IFS= read -r update_line; do
     [ -n "$fetched_oid" ] || reject "$ref は GitHub にありません"
     push_spec=":$ref"                       # ブランチ削除
   else
-    check_commit "$ref" "$new_oid"
+    check_new_commits "$ref" "$new_oid"
     push_spec="$new_oid:$ref"
     # 同じ名前のタグがないかを後で確かめる（削除は紛らわしさをなくすので許す）
     created_or_updated_branches="$created_or_updated_branches $branch_name"

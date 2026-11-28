@@ -84,14 +84,14 @@ git commit --quiet --amend --message b2
 expect ok "強制 push" --force origin feat
 expect ok "feature ブランチの削除" origin :feat
 
-# ワークフローは保護ブランチのどれか 1 つと同一のものだけ（消すのは可）。中身は見ない
+# ワークフローは保護ブランチのどれか 1 つと「完全に同一」のものだけ（消すのも不可）。中身は見ない
 wf w1 "on: pull_request";                                          expect ng "ワークフローの変更" origin w1
 git switch --quiet --force-create w2 origin/main; echo 'on: push' > .github/workflows/new.yml; git add --all; git commit --quiet --message w2
 expect ng "ワークフローの追加" origin w2
 git switch --quiet --force-create w3 origin/main; echo 'on: push' > ".github/workflows/$(printf '\303\251').yml"; git add --all; git commit --quiet --message w3
 expect ng "ASCII 以外を含む名前のワークフローの追加" origin w3
 git switch --quiet --force-create w4 origin/main; git rm --quiet .github/workflows/ci.yml; git commit --quiet --message w4
-expect ok "ワークフローの削除" origin w4
+expect ng "ワークフローの削除（部分的に欠けた一覧は、PR のマージで継ぎ合わせの材料になるため不可）" origin w4
 git switch --quiet --force-create w5 origin/main; git mv .github/workflows/ci.yml .github/workflows/ci2.yml; git commit --quiet --message w5
 expect ng "ワークフローの名前の変更" origin w5
 git switch --quiet --force-create w6 origin/main; chmod +x .github/workflows/ci.yml; git commit --quiet --all --message w6
@@ -107,6 +107,17 @@ git switch --quiet --force-create w10 origin/main; mkdir --parents .GITHUB/workf
 expect ng "大文字の .GITHUB" origin w10
 git switch --quiet --force-create w11 origin/main; mkdir --parents .github/Workflows; echo 'on: push' > .github/Workflows/x.yml; git add --all; git commit --quiet --message w11
 expect ng "大文字の .github/Workflows" origin w11
+# Unicode の変種（APFS・NTFS の大文字小文字を区別しない比較で .github/actions や .github と同じになる）。.github 自体は main と同一のまま足す
+git switch --quiet --force-create w11a origin/main; long_s=$(printf '\305\277'); mkdir --parents ".github/action${long_s}/a"; echo 'runs: evil' > ".github/action${long_s}/a/action.yml"; git add --all; git commit --quiet --message w11a
+expect ng ".github/actionſ（U+017F）" origin w11a
+git switch --quiet --force-create w11b origin/main; dotless_i=$(printf '\304\261'); mkdir --parents ".g${dotless_i}thub/workflows"; echo 'on: push' > ".g${dotless_i}thub/workflows/y.yml"; git add --all; git commit --quiet --message w11b
+expect ng "ルートの .gıthub（U+0131）" origin w11b
+git switch --quiet --force-create w11c origin/main; mkdir --parents ".github/workflows/${long_s}"; echo 'on: push' > ".github/workflows/${long_s}/x.yml"; git add --all; git commit --quiet --message w11c
+expect ng ".github/workflows の下の ASCII 以外のディレクトリ（ワークフローの追加）" origin w11c
+git switch --quiet --force-create w11d origin/main; echo 'ok' > "$(printf 'docs_\303\251.md')"; git add --all; git commit --quiet --message w11d
+expect ng "ルートの ASCII 以外のファイル名" origin w11d
+git switch --quiet --force-create w11e origin/main; mkdir --parents src; echo ok > "src/$(printf '\303\251').txt"; git add --all; git commit --quiet --message w11e
+expect ok "深い場所の ASCII 以外のファイル名は許す" origin w11e
 git switch --quiet --force-create w12 origin/main; git rm -r --quiet .github/actions; ln -s ../x .github/actions; git add --all; git commit --quiet --message w12
 expect ng ".github/actions がシンボリックリンク" origin w12
 # 並びの壊れた木（zzz の後ろに .github）。ls-tree に .github が見えないので、fsck で止める
@@ -244,6 +255,14 @@ expect ng "heads/ で始まる名前" origin u8:refs/heads/heads/main
 expect ng "tags/ で始まる名前（タグ v9 がある）" origin u8:refs/heads/tags/v9
 expect ng "シェルの特殊文字を含む名前" origin 'u8:refs/heads/x$(id)'
 expect ng "; を含む名前" origin 'u8:refs/heads/a;b'
+expect ng "origin/ で始まる名前" origin u8:refs/heads/origin/main
+expect ng "upstream/ で始まる名前" origin u8:refs/heads/upstream/main
+expect ng "origin という名前" origin u8:refs/heads/origin
+expect ng "大文字の Origin/ で始まる名前" origin u8:refs/heads/Origin/x
+expect ng "保護ブランチ名で終わる名前（x/main）" origin u8:refs/heads/x/main
+expect ng "保護ブランチ名で終わる名前（x/Develop）" origin u8:refs/heads/x/Develop
+expect ok "origin で始まるが / で区切られない名前" origin u8:refs/heads/origin-cleanup
+expect ok "origin を途中に含む名前" origin u8:refs/heads/agent/fix-origin-bug
 expect ok "英数字と . _ / - の名前" origin u8:refs/heads/agent/fix-1.2_x
 # 変な mode（中身は main と同じ）
 ci_blob=$(git ls-tree origin/main .github/workflows/ci.yml | awk '{print $3}')
@@ -329,6 +348,45 @@ gh_has many1 && { fail=$((fail+1)); echo "FAIL 51 個のうちどれかが GitHu
 if [ $hook_status -eq 0 ] || ! grep -q '受け付けを始めた後に GitHub で更新' "$WORK_DIR/out" || gh_has race2
 then fail=$((fail+1)); echo "FAIL 判定の間に保護ブランチが更新されたら拒否"; sed 's/^/     /' "$WORK_DIR/out"; else pass=$((pass+1)); echo "ok   判定の間に保護ブランチが更新されたら拒否"; fi
 git fetch --quiet; git --git-dir="$WORK_DIR/gate.git" fetch --quiet --prune upstream '+refs/heads/*:refs/heads/*'
+
+# 新しく持ち込むコミットすべてを検査する（先端だけではない）
+# clean なブランチ（.github を触らない）は、複数コミットでも通る（正常系の回帰）
+git switch --quiet --force-create multiclean origin/main
+echo m1 > mc1; git add mc1; git commit --quiet --message mc1
+echo m2 > mc2; git add mc2; git commit --quiet --message mc2
+echo m3 > mc3; git add mc3; git commit --quiet --message mc3
+expect ok "複数コミットの clean なブランチ（.github を触らない）" origin multiclean
+# F1: 先端は main と同一でも、途中のコミットでワークフローを消したものは拒否
+# （先端だけ見ていた以前の実装はこれを通し、PR のマージで消えた版を別ブランチと継ぎ合わせられた）
+git switch --quiet --force-create f1del origin/main
+git rm --quiet .github/workflows/ci.yml; git commit --quiet --message "途中でワークフローを消す"
+git checkout --quiet origin/main -- .github/workflows/ci.yml; git commit --quiet --message "先端で元に戻す"
+expect ng "F1: 途中でワークフローを消したコミット（先端は main と同一）" origin f1del
+# F1: 途中のコミットで、.github の外のファイルを rename でワークフローの位置に持ち込むものも拒否
+# （byte 同一でも、途中のコミットではワークフローの一覧が main と違う）
+git switch --quiet --force-create f1ren origin/main
+mkdir wfout; git mv .github/workflows/ci.yml wfout/ci.yml; git commit --quiet --message "途中で外に出す"
+git mv wfout/ci.yml .github/workflows/ci.yml; git commit --quiet --message "先端で rename して戻す"
+expect ng "F1: 途中で .github の外へ rename（先端は main と同一）" origin f1ren
+# F2: main / develop に、トリガーと権限が違う 2 つのワークフローを置く
+( cd "$WORK_DIR/seed" && git fetch --quiet
+  for b in main develop; do
+    git switch --quiet --force-create "f2setup-$b" "origin/$b"
+    printf 'on: pull_request\n' > .github/workflows/ci.yml
+    printf 'on:\n  push:\n    branches: [main]\npermissions:\n  contents: write\n' > .github/workflows/deploy.yml
+    git add --all && git commit --quiet --message "f2 setup $b" && git push --quiet origin "HEAD:$b"
+  done )
+git fetch --quiet
+# それぞれ 1 つだけに減らした 2 つのブランチ（どちらも main の部分集合）。
+# 以前は両方 subset として通り、PR のマージで ci.yml に deploy.yml のトリガー/権限を継ぎ合わせられた。
+# 完全一致なら、どちらも拒否される（部分集合は不可）
+git switch --quiet --force-create f2h origin/main; git rm --quiet .github/workflows/ci.yml; git commit --quiet --message f2h
+expect ng "F2: deploy.yml だけに減らす（main の部分集合）" origin f2h
+git switch --quiet --force-create f2b origin/main; git rm --quiet .github/workflows/deploy.yml; git commit --quiet --message f2b
+expect ng "F2: ci.yml だけに減らす（main の部分集合）" origin f2b
+# 2 つとも揃っていれば（main と完全一致）通る
+git switch --quiet --force-create f2ok origin/main; echo f2 > f2; git add f2; git commit --quiet --message f2ok
+expect ok "F2 の後: main と完全一致なら通る" origin f2ok
 
 # パスフレーズ付きの鍵が未解除のとき
 if command -v ssh-agent >/dev/null; then
